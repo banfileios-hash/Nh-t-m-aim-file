@@ -1,0 +1,111 @@
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <cstring>
+#include <ctime>
+#include <cstdint>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <openssl/sha.h>
+
+#pragma pack(push, 1)
+struct AmlockHeader {
+    uint32_t magic;
+    uint8_t version;
+    uint32_t timestamp;
+    uint32_t pid;
+    uint8_t checksum[32];
+    uint8_t reserved[23];
+};
+#pragma pack(pop)
+
+struct AmlockFile {
+    AmlockHeader header;
+    uint8_t username[64];
+    uint8_t hostname[64];
+    uint8_t filepath[128];
+    uint8_t acl_bitmap[8];
+    uint8_t uid_gid[64];
+    uint8_t reserved[192];
+};
+
+void compute_sha256(const uint8_t* data, size_t len, uint8_t* output) {
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+    SHA256_Update(&ctx, data, len);
+    SHA256_Final(output, &ctx);
+}
+
+std::string get_username() {
+    const char* user = std::getenv("USER");
+    if (!user) user = std::getenv("USERNAME");
+    if (!user) user = "unknown";
+    return std::string(user);
+}
+
+std::string get_hostname() {
+    char host[256];
+    if (gethostname(host, sizeof(host)) == 0) {
+        return std::string(host);
+    }
+    return "unknown";
+}
+
+uint32_t get_pid() {
+    return static_cast<uint32_t>(getpid());
+}
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cerr << "Su dung: " << argv[0] << " <duong_dan_file.amlock>" << std::endl;
+        return 1;
+    }
+
+    const std::string file_path = argv[1];
+
+    std::ifstream in_file(file_path, std::ios::binary);
+    if (!in_file) {
+        std::cerr << "Loi: Khong the mo file " << file_path << std::endl;
+        return 1;
+    }
+
+    AmlockFile amlock;
+    in_file.read(reinterpret_cast<char*>(&amlock), sizeof(amlock));
+    in_file.close();
+
+    if (amlock.header.magic != 0x4C4F434B) {
+        std::cerr << "Loi: File khong dung dinh dang amlock" << std::endl;
+        return 1;
+    }
+
+    uint8_t saved_checksum[32];
+    std::memcpy(saved_checksum, amlock.header.checksum, 32);
+    std::memset(amlock.header.checksum, 0, 32);
+
+    uint8_t new_checksum[32];
+    compute_sha256(reinterpret_cast<const uint8_t*>(&amlock), sizeof(amlock), new_checksum);
+
+    if (std::memcmp(saved_checksum, new_checksum, 32) == 0) {
+        std::cout << "Checksum hop le. Khong can fix." << std::endl;
+        return 0;
+    }
+
+    std::memcpy(amlock.header.checksum, new_checksum, 32);
+
+    std::ofstream out_file(file_path, std::ios::binary);
+    if (!out_file) {
+        std::cerr << "Loi: Khong the ghi file " << file_path << std::endl;
+        return 1;
+    }
+    out_file.write(reinterpret_cast<const char*>(&amlock), sizeof(amlock));
+    out_file.close();
+
+    std::cout << "Da fix checksum cho file: " << file_path << std::endl;
+    std::cout << "Checksum moi: ";
+    for (int i = 0; i < 32; i++) {
+        printf("%02x", new_checksum[i]);
+    }
+    std::cout << std::endl;
+
+    return 0;
+}
