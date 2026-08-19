@@ -1,0 +1,70 @@
+#include <jni.h>
+#include <dlfcn.h>
+#include <sys/mman.h>
+#include <stdint.h>
+#include <string.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <android/log.h>
+
+#define LOG_TAG "TouchRed"
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+
+#define OFFSET_TOUCH_FLAG       0x0012A4B0
+#define OFFSET_RANGE_VALUE      0x0012A4B4
+#define OFFSET_FUNC_UPDATE      0x00045C30
+
+void* g_base = NULL;
+int g_running = 1;
+
+void patch_memory(uintptr_t abs_addr, uint8_t* data, size_t len) {
+    uintptr_t page_start = abs_addr & ~0xFFF;
+    mprotect((void*)page_start, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC);
+    memcpy((void*)abs_addr, data, len);
+    __builtin___clear_cache((char*)abs_addr, (char*)(abs_addr + len));
+}
+
+void* touch_thread(void* arg) {
+    uintptr_t base = (uintptr_t)arg;
+    while (g_running) {
+        float* touch_flag = (float*)(base + OFFSET_TOUCH_FLAG);
+        float* range_value = (float*)(base + OFFSET_RANGE_VALUE);
+
+        if (*touch_flag > 0.5f) {
+            *range_value = 1000.0f;    // Kéo = Đỏ (full map)
+        } else {
+            *range_value = 50.0f;      // Thả = Vàng (gần)
+        }
+
+        usleep(10000);
+    }
+    return NULL;
+}
+
+void patch_touch_range(uintptr_t base) {
+    uint8_t touch_patch[] = {
+        0x00, 0x48, 0x01, 0x28, 0x03, 0xD0,
+        0x00, 0x48, 0x00, 0x44, 0x02, 0xE0,
+        0x00, 0x48, 0x00, 0x44, 0x00, 0x60
+    };
+    patch_memory(base + OFFSET_FUNC_UPDATE, touch_patch, sizeof(touch_patch));
+    LOGD("Touch range patch applied: keo do, tha vang");
+}
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+    void* base = dlopen("libmain.so", RTLD_NOW);
+    if (!base) base = dlopen("libgame.so", RTLD_NOW);
+    if (!base) base = dlopen("libunity.so", RTLD_NOW);
+    g_base = base;
+
+    LOGD("Touch Red loaded at base: 0x%lx", (uintptr_t)base);
+
+    patch_touch_range((uintptr_t)base);
+
+    pthread_t t;
+    pthread_create(&t, NULL, touch_thread, (void*)base);
+    pthread_detach(t);
+
+    LOGD("Touch Red active: keo = do (1000), tha = vang (50)");
+    return JNI_VERSION_1_6;
+}
