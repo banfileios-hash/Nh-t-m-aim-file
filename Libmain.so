@@ -1,0 +1,277 @@
+#include <jni.h>
+#include <dlfcn.h>
+#include <sys/mman.h>
+#include <stdint.h>
+#include <string.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <math.h>
+#include <android/log.h>
+#include <fstream>
+#include <string>
+#include <map>
+
+#define LOG_TAG "AmlockAll"
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+
+#define OFFSET_PLAYER_POS_X     0x0012A4D8
+#define OFFSET_PLAYER_POS_Y     0x0012A4DC
+#define OFFSET_PLAYER_POS_Z     0x0012A4E0
+#define OFFSET_PLAYER_ROT_X     0x0012A4E4
+#define OFFSET_PLAYER_ROT_Y     0x0012A4E8
+#define OFFSET_ENEMY_LIST       0x0012A500
+#define OFFSET_ENEMY_COUNT      0x0012A600
+#define OFFSET_ENEMY_HEAD_X     0x0012A4CC
+#define OFFSET_ENEMY_HEAD_Y     0x0012A4D0
+#define OFFSET_ENEMY_HEAD_Z     0x0012A4D4
+#define OFFSET_ENEMY_BODY_X     0x0012A4E0
+#define OFFSET_ENEMY_BODY_Y     0x0012A4E4
+#define OFFSET_ENEMY_BODY_Z     0x0012A4E8
+#define OFFSET_ENEMY_HP         0x0012A610
+#define OFFSET_ENEMY_MAX_HP     0x0012A614
+#define OFFSET_ENEMY_VISIBLE    0x0012A618
+#define OFFSET_ENEMY_COLOR_R    0x0012A4C0
+#define OFFSET_ENEMY_COLOR_G    0x0012A4C4
+#define OFFSET_ENEMY_COLOR_B    0x0012A4C8
+#define OFFSET_CAMERA_LOCK      0x0012A4B0
+#define OFFSET_TOUCH_FLAG       0x0012A4B4
+#define OFFSET_RANGE_VALUE      0x0012A4B8
+#define OFFSET_AIM_ASSIST       0x0012A4BC
+#define OFFSET_BULLET_SPREAD    0x0012A4C0
+#define OFFSET_SHAKE_X          0x0012A4C4
+#define OFFSET_SHAKE_Y          0x0012A4C8
+#define OFFSET_SHAKE_Z          0x0012A4CC
+#define OFFSET_RECOIL_X         0x0012A4D0
+#define OFFSET_RECOIL_Y         0x0012A4D4
+#define OFFSET_FUNC_DAMAGE      0x00046000
+#define OFFSET_FUNC_HITBOX      0x00045E80
+#define OFFSET_FUNC_UPDATE      0x00045C30
+#define OFFSET_FUNC_CAMERA      0x00045E80
+#define OFFSET_FUNC_RECOIL      0x00045F00
+#define OFFSET_FUNC_SHAKE       0x00045F80
+#define OFFSET_FUNC_BULLET      0x00046080
+#define OFFSET_FUNC_WEAPON      0x00046100
+
+struct Vector3 { float x, y, z; };
+struct Enemy { Vector3 head; Vector3 body; float r, g, b; float hp; float max_hp; uint32_t alive; uint32_t visible; };
+
+void* g_base = NULL;
+int g_running = 1;
+
+struct Config {
+    int aimbot = 1;
+    int esp = 1;
+    int touch_range = 1;
+    int body_to_head = 1;
+    int no_recoil = 1;
+    int zero_spread = 1;
+    int unlock_camera = 1;
+    int fix_shake = 1;
+    int lock_target = 1;
+    int no_reload = 0;
+    int infinite_ammo = 0;
+    int wallhack = 1;
+    float max_distance = 1000.0f;
+    float touch_red = 1000.0f;
+    float touch_yellow = 50.0f;
+    float damage_multiplier = 5.0f;
+    float head_distance = 100.0f;
+} g_config;
+
+uintptr_t g_locked_addr = 0;
+int g_has_target = 0;
+
+void patch_memory(uintptr_t abs_addr, uint8_t* data, size_t len) {
+    uintptr_t page_start = abs_addr & ~0xFFF;
+    mprotect((void*)page_start, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC);
+    memcpy((void*)abs_addr, data, len);
+    __builtin___clear_cache((char*)abs_addr, (char*)(abs_addr + len));
+}
+
+float dist_3d(Vector3* a, Vector3* b) {
+    float dx = a->x - b->x;
+    float dy = a->y - b->y;
+    float dz = a->z - b->z;
+    return sqrt(dx*dx + dy*dy + dz*dz);
+}
+
+void aim_at_point(Vector3* player, Vector3* target, float* rot_x, float* rot_y) {
+    float dx = target->x - player->x;
+    float dy = target->y - player->y;
+    float dz = target->z - player->z;
+    *rot_y = atan2(dx, dz) * 57.2957795f;
+    *rot_x = atan2(dy, sqrt(dx*dx + dz*dz)) * 57.2957795f;
+}
+
+void load_config() {
+    const char* paths[] = {
+        "/sdcard/amlock_config.txt",
+        "/data/local/tmp/amlock_config.txt",
+        "/sdcard/Android/data/com.dts.freefireth/files/amlock_config.txt"
+    };
+
+    std::ifstream file;
+    for (int i = 0; i < 3; i++) {
+        file.open(paths[i]);
+        if (file.is_open()) break;
+    }
+
+    if (!file.is_open()) {
+        LOGD("Config not found, using defaults");
+        return;
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#' || line[0] == '[') continue;
+        size_t pos = line.find('=');
+        if (pos == std::string::npos) continue;
+
+        std::string key = line.substr(0, pos);
+        std::string value = line.substr(pos + 1);
+
+        if (key == "AIMBOT") g_config.aimbot = std::stoi(value);
+        else if (key == "ESP") g_config.esp = std::stoi(value);
+        else if (key == "TOUCH_RANGE") g_config.touch_range = std::stoi(value);
+        else if (key == "BODY_TO_HEAD") g_config.body_to_head = std::stoi(value);
+        else if (key == "NO_RECOIL") g_config.no_recoil = std::stoi(value);
+        else if (key == "ZERO_SPREAD") g_config.zero_spread = std::stoi(value);
+        else if (key == "UNLOCK_CAMERA") g_config.unlock_camera = std::stoi(value);
+        else if (key == "FIX_SHAKE") g_config.fix_shake = std::stoi(value);
+        else if (key == "LOCK_TARGET") g_config.lock_target = std::stoi(value);
+        else if (key == "NO_RELOAD") g_config.no_reload = std::stoi(value);
+        else if (key == "INFINITE_AMMO") g_config.infinite_ammo = std::stoi(value);
+        else if (key == "WALLHACK") g_config.wallhack = std::stoi(value);
+        else if (key == "MAX_DISTANCE") g_config.max_distance = std::stof(value);
+        else if (key == "TOUCH_RED") g_config.touch_red = std::stof(value);
+        else if (key == "TOUCH_YELLOW") g_config.touch_yellow = std::stof(value);
+        else if (key == "DAMAGE_MULTIPLIER") g_config.damage_multiplier = std::stof(value);
+        else if (key == "HEAD_DISTANCE") g_config.head_distance = std::stof(value);
+    }
+    file.close();
+
+    LOGD("Config loaded: aimbot=%d esp=%d touch=%d body_to_head=%d",
+         g_config.aimbot, g_config.esp, g_config.touch_range, g_config.body_to_head);
+}
+
+void* all_in_one_thread(void* arg) {
+    uintptr_t base = (uintptr_t)arg;
+    while (g_running) {
+        Vector3* player_pos = (Vector3*)(base + OFFSET_PLAYER_POS_X);
+        float* player_rot_x = (float*)(base + OFFSET_PLAYER_ROT_X);
+        float* player_rot_y = (float*)(base + OFFSET_PLAYER_ROT_Y);
+        int* enemy_count = (int*)(base + OFFSET_ENEMY_COUNT);
+        Enemy* enemies = (Enemy*)(base + OFFSET_ENEMY_LIST);
+        float* camera_lock = (float*)(base + OFFSET_CAMERA_LOCK);
+        float* touch_flag = (float*)(base + OFFSET_TOUCH_FLAG);
+        float* range_value = (float*)(base + OFFSET_RANGE_VALUE);
+        float* aim_assist = (float*)(base + OFFSET_AIM_ASSIST);
+        float* bullet_spread = (float*)(base + OFFSET_BULLET_SPREAD);
+        float* shake_x = (float*)(base + OFFSET_SHAKE_X);
+        float* shake_y = (float*)(base + OFFSET_SHAKE_Y);
+        float* shake_z = (float*)(base + OFFSET_SHAKE_Z);
+        float* recoil_x = (float*)(base + OFFSET_RECOIL_X);
+        float* recoil_y = (float*)(base + OFFSET_RECOIL_Y);
+
+        if (g_config.unlock_camera) {
+            *camera_lock = 0.0f;
+            *aim_assist = 0.0f;
+        }
+
+        if (g_config.zero_spread) *bullet_spread = 0.0f;
+        if (g_config.fix_shake) { *shake_x = 0.0f; *shake_y = 0.0f; *shake_z = 0.0f; }
+        if (g_config.no_recoil) { *recoil_x = 0.0f; *recoil_y = 0.0f; }
+
+        if (g_config.touch_range) {
+            *range_value = (*touch_flag > 0.5f) ? g_config.touch_red : g_config.touch_yellow;
+        }
+
+        if (g_config.esp) {
+            for (int i = 0; i < *enemy_count && i < 20; i++) {
+                if (!enemies[i].alive || !enemies[i].visible || enemies[i].hp <= 0) continue;
+                uint8_t color_code[] = {0x00, 0x48, 0x00, 0x44, 0x00, 0x60};
+                patch_memory((uintptr_t)&enemies[i].r, color_code, sizeof(color_code));
+            }
+        }
+
+        Enemy* target = NULL;
+        float min_d = 99999.0f;
+
+        if (g_config.aimbot) {
+            for (int i = 0; i < *enemy_count && i < 20; i++) {
+                if (!enemies[i].alive || !enemies[i].visible || enemies[i].hp <= 0) continue;
+
+                float d_head = dist_3d(player_pos, &enemies[i].head);
+                float d_body = dist_3d(player_pos, &enemies[i].body);
+                float d = (d_head < d_body) ? d_head : d_body;
+
+                if (d < g_config.max_distance && d < min_d) {
+                    min_d = d;
+                    target = &enemies[i];
+                }
+            }
+
+            if (target != NULL) {
+                if (min_d < g_config.head_distance) {
+                    aim_at_point(player_pos, &target->head, player_rot_x, player_rot_y);
+                } else {
+                    aim_at_point(player_pos, &target->body, player_rot_x, player_rot_y);
+                }
+
+                if (g_config.body_to_head) {
+                    uint8_t bth_code[] = {0x00, 0x48, 0x00, 0x44, 0x00, 0x60};
+                    patch_memory(base + OFFSET_FUNC_DAMAGE, bth_code, sizeof(bth_code));
+                    patch_memory(base + OFFSET_FUNC_HITBOX, bth_code, sizeof(bth_code));
+                }
+
+                if (g_config.damage_multiplier > 1.0f) {
+                    uint8_t dmg_code[] = {0x00, 0x48, 0x00, 0x44, 0x00, 0x60};
+                    patch_memory(base + OFFSET_FUNC_DAMAGE + 0x10, dmg_code, sizeof(dmg_code));
+                }
+            }
+        }
+
+        if (g_config.wallhack) {
+            uint8_t wh_code[] = {0x00, 0x48, 0x00, 0x44, 0x00, 0x60};
+            patch_memory(base + OFFSET_FUNC_UPDATE + 0x50, wh_code, sizeof(wh_code));
+        }
+
+        usleep(10000);
+    }
+    return NULL;
+}
+
+void patch_all(uintptr_t base) {
+    uint8_t zero_code[] = {0x00, 0x20, 0x00, 0x60};
+    uint8_t touch_patch[] = {
+        0x00, 0x48, 0x01, 0x28, 0x03, 0xD0,
+        0x00, 0x48, 0x00, 0x44, 0x02, 0xE0,
+        0x00, 0x48, 0x00, 0x44, 0x00, 0x60
+    };
+
+    patch_memory(base + OFFSET_FUNC_CAMERA, zero_code, sizeof(zero_code));
+    patch_memory(base + OFFSET_FUNC_RECOIL, zero_code, sizeof(zero_code));
+    patch_memory(base + OFFSET_FUNC_SHAKE, zero_code, sizeof(zero_code));
+    patch_memory(base + OFFSET_FUNC_UPDATE, touch_patch, sizeof(touch_patch));
+
+    LOGD("All patches applied");
+}
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+    void* base = dlopen("libmain.so", RTLD_NOW);
+    if (!base) base = dlopen("libgame.so", RTLD_NOW);
+    if (!base) base = dlopen("libunity.so", RTLD_NOW);
+    g_base = base;
+
+    LOGD("Amlock All-in-One loaded at base: 0x%lx", (uintptr_t)base);
+
+    load_config();
+    patch_all((uintptr_t)base);
+
+    pthread_t t;
+    pthread_create(&t, NULL, all_in_one_thread, (void*)base);
+    pthread_detach(t);
+
+    LOGD("Amlock All-in-One active: tat ca tinh nang");
+    return JNI_VERSION_1_6;
+}
