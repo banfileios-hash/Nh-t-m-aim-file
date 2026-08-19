@@ -1,0 +1,165 @@
+#include <jni.h>
+#include <dlfcn.h>
+#include <sys/mman.h>
+#include <stdint.h>
+#include <string.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <math.h>
+#include <android/log.h>
+
+#define LOG_TAG "FixAim"
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+
+#define OFFSET_PLAYER_POS_X     0x0012A4D8
+#define OFFSET_PLAYER_POS_Y     0x0012A4DC
+#define OFFSET_PLAYER_POS_Z     0x0012A4E0
+#define OFFSET_PLAYER_ROT_X     0x0012A4E4
+#define OFFSET_PLAYER_ROT_Y     0x0012A4E8
+#define OFFSET_ENEMY_LIST       0x0012A500
+#define OFFSET_ENEMY_COUNT      0x0012A600
+#define OFFSET_ENEMY_HEAD_X     0x0012A4CC
+#define OFFSET_ENEMY_HEAD_Y     0x0012A4D0
+#define OFFSET_ENEMY_HEAD_Z     0x0012A4D4
+#define OFFSET_ENEMY_BODY_X     0x0012A4E0
+#define OFFSET_ENEMY_BODY_Y     0x0012A4E4
+#define OFFSET_ENEMY_BODY_Z     0x0012A4E8
+#define OFFSET_ENEMY_HP         0x0012A610
+#define OFFSET_ENEMY_VISIBLE    0x0012A614
+#define OFFSET_CAMERA_LOCK      0x0012A4B0
+#define OFFSET_TOUCH_FLAG       0x0012A4B4
+#define OFFSET_RANGE_VALUE      0x0012A4B8
+#define OFFSET_AIM_ASSIST       0x0012A4BC
+#define OFFSET_FUNC_UPDATE      0x00045C30
+#define OFFSET_FUNC_CAMERA      0x00045E80
+#define OFFSET_FUNC_DAMAGE      0x00046000
+#define OFFSET_FUNC_HITBOX      0x00045F00
+
+struct Vector3 { float x, y, z; };
+struct Enemy { Vector3 head; Vector3 body; float hp; uint32_t alive; uint32_t visible; };
+
+void* g_base = NULL;
+int g_running = 1;
+int g_locked = 0;
+uintptr_t g_locked_addr = 0;
+
+void patch_memory(uintptr_t abs_addr, uint8_t* data, size_t len) {
+    uintptr_t page_start = abs_addr & ~0xFFF;
+    mprotect((void*)page_start, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC);
+    memcpy((void*)abs_addr, data, len);
+    __builtin___clear_cache((char*)abs_addr, (char*)(abs_addr + len));
+}
+
+float dist_3d(Vector3* a, Vector3* b) {
+    float dx = a->x - b->x;
+    float dy = a->y - b->y;
+    float dz = a->z - b->z;
+    return sqrt(dx*dx + dy*dy + dz*dz);
+}
+
+void aim_at_point(Vector3* player, Vector3* target, float* rot_x, float* rot_y) {
+    float dx = target->x - player->x;
+    float dy = target->y - player->y;
+    float dz = target->z - player->z;
+    *rot_y = atan2(dx, dz) * 57.2957795f;
+    *rot_x = atan2(dy, sqrt(dx*dx + dz*dz)) * 57.2957795f;
+}
+
+void* fix_aim_thread(void* arg) {
+    uintptr_t base = (uintptr_t)arg;
+    while (g_running) {
+        Vector3* player_pos = (Vector3*)(base + OFFSET_PLAYER_POS_X);
+        float* player_rot_x = (float*)(base + OFFSET_PLAYER_ROT_X);
+        float* player_rot_y = (float*)(base + OFFSET_PLAYER_ROT_Y);
+        int* enemy_count = (int*)(base + OFFSET_ENEMY_COUNT);
+        Enemy* enemies = (Enemy*)(base + OFFSET_ENEMY_LIST);
+        float* camera_lock = (float*)(base + OFFSET_CAMERA_LOCK);
+        float* touch_flag = (float*)(base + OFFSET_TOUCH_FLAG);
+        float* range_value = (float*)(base + OFFSET_RANGE_VALUE);
+        float* aim_assist = (float*)(base + OFFSET_AIM_ASSIST);
+
+        *camera_lock = 0.0f;
+        *aim_assist = 0.0f;
+
+        if (*touch_flag > 0.5f) {
+            *range_value = 1000.0f;
+        } else {
+            *range_value = 50.0f;
+        }
+
+        Enemy* target = NULL;
+        float min_d = 99999.0f;
+
+        for (int i = 0; i < *enemy_count && i < 20; i++) {
+            if (!enemies[i].alive || !enemies[i].visible || enemies[i].hp <= 0) continue;
+
+            float d_head = dist_3d(player_pos, &enemies[i].head);
+            float d_body = dist_3d(player_pos, &enemies[i].body);
+            float d = (d_head < d_body) ? d_head : d_body;
+
+            if (d < 1000.0f && d < min_d) {
+                min_d = d;
+                target = &enemies[i];
+            }
+        }
+
+        if (target != NULL) {
+            if (min_d < 100.0f) {
+                aim_at_point(player_pos, &target->head, player_rot_x, player_rot_y);
+            } else {
+                aim_at_point(player_pos, &target->body, player_rot_x, player_rot_y);
+            }
+
+            uint8_t bth_code[] = {0x00, 0x48, 0x00, 0x44, 0x00, 0x60};
+            patch_memory(base + OFFSET_FUNC_DAMAGE, bth_code, sizeof(bth_code));
+            patch_memory(base + OFFSET_FUNC_HITBOX, bth_code, sizeof(bth_code));
+
+            if (!g_locked) {
+                g_locked = 1;
+                g_locked_addr = (uintptr_t)target;
+                LOGD("Locked on target at distance %.1f", min_d);
+            }
+        } else {
+            if (g_locked) {
+                g_locked = 0;
+                g_locked_addr = 0;
+                LOGD("Unlocked target");
+            }
+        }
+
+        usleep(10000);
+    }
+    return NULL;
+}
+
+void patch_fix_aim(uintptr_t base) {
+    uint8_t unlock_code[] = {0x00, 0x20, 0x00, 0x60, 0x00, 0x20, 0x00, 0x60};
+    patch_memory(base + OFFSET_FUNC_CAMERA, unlock_code, sizeof(unlock_code));
+
+    uint8_t touch_patch[] = {
+        0x00, 0x48, 0x01, 0x28, 0x03, 0xD0,
+        0x00, 0x48, 0x00, 0x44, 0x02, 0xE0,
+        0x00, 0x48, 0x00, 0x44, 0x00, 0x60
+    };
+    patch_memory(base + OFFSET_FUNC_UPDATE, touch_patch, sizeof(touch_patch));
+
+    LOGD("Fix aim patches applied: unlock camera + touch red/yellow");
+}
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+    void* base = dlopen("libmain.so", RTLD_NOW);
+    if (!base) base = dlopen("libgame.so", RTLD_NOW);
+    if (!base) base = dlopen("libunity.so", RTLD_NOW);
+    g_base = base;
+
+    LOGD("Fix Aim loaded at base: 0x%lx", (uintptr_t)base);
+
+    patch_fix_aim((uintptr_t)base);
+
+    pthread_t t;
+    pthread_create(&t, NULL, fix_aim_thread, (void*)base);
+    pthread_detach(t);
+
+    LOGD("Fix Aim active: fix lo tam + fix keo qua dau/nguoi + keo do/tha vang");
+    return JNI_VERSION_1_6;
+}
