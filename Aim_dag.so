@@ -1,0 +1,135 @@
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <cstring>
+#include <ctime>
+#include <cstdint>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <openssl/sha.h>
+
+#pragma pack(push, 1)
+struct AmlockHeader {
+    uint32_t magic;
+    uint8_t version;
+    uint32_t timestamp;
+    uint32_t pid;
+    uint8_t checksum[32];
+    uint8_t reserved[23];
+};
+#pragma pack(pop)
+
+struct AmlockFile {
+    AmlockHeader header;
+    uint8_t username[64];
+    uint8_t hostname[64];
+    uint8_t filepath[128];
+    uint8_t acl_bitmap[8];
+    uint8_t uid_gid[64];
+    uint8_t reserved[192];
+};
+
+void compute_sha256(const uint8_t* data, size_t len, uint8_t* output) {
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+    SHA256_Update(&ctx, data, len);
+    SHA256_Final(output, &ctx);
+}
+
+std::string get_username() {
+    const char* user = std::getenv("USER");
+    if (!user) user = std::getenv("USERNAME");
+    if (!user) user = "unknown";
+    return std::string(user);
+}
+
+std::string get_hostname() {
+    char host[256];
+    if (gethostname(host, sizeof(host)) == 0) {
+        return std::string(host);
+    }
+    return "unknown";
+}
+
+uint32_t get_pid() {
+    return static_cast<uint32_t>(getpid());
+}
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cerr << "Su dung: " << argv[0] << " <duong_dan_file.amlock> [duong_dan_file_bi_khoa]" << std::endl;
+        return 1;
+    }
+
+    const std::string output_path = argv[1];
+    const std::string locked_path = (argc >= 3) ? argv[2] : output_path;
+
+    AmlockFile amlock;
+    std::memset(&amlock, 0, sizeof(amlock));
+
+    amlock.header.magic = 0x4C4F434B;
+    amlock.header.version = 0x01;
+
+    amlock.header.timestamp = static_cast<uint32_t>(std::time(nullptr));
+    amlock.header.pid = get_pid();
+
+    std::string user = get_username();
+    std::string host = get_hostname();
+    std::strncpy(reinterpret_cast<char*>(amlock.username), user.c_str(), 63);
+    std::strncpy(reinterpret_cast<char*>(amlock.hostname), host.c_str(), 63);
+    std::strncpy(reinterpret_cast<char*>(amlock.filepath), locked_path.c_str(), 127);
+
+    uint64_t bitmap = 0x07;
+    std::memcpy(amlock.acl_bitmap, &bitmap, 8);
+
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    char uid_gid_str[64];
+    snprintf(uid_gid_str, sizeof(uid_gid_str), "%d:%d", uid, gid);
+    std::strncpy(reinterpret_cast<char*>(amlock.uid_gid), uid_gid_str, 63);
+
+    std::memset(amlock.header.checksum, 0, 32);
+    uint8_t sha_result[32];
+    compute_sha256(reinterpret_cast<const uint8_t*>(&amlock), sizeof(amlock), sha_result);
+    std::memcpy(amlock.header.checksum, sha_result, 32);
+
+    std::ofstream file(output_path, std::ios::binary);
+    if (!file) {
+        std::cerr << "Loi: Khong the tao file " << output_path << std::endl;
+        return 1;
+    }
+    file.write(reinterpret_cast<const char*>(&amlock), sizeof(amlock));
+    file.close();
+
+    #ifdef _WIN32
+    #else
+        chmod(output_path.c_str(), 0444);
+    #endif
+
+    std::cout << "Da tao file lock: " << output_path << std::endl;
+    std::cout << "Kich thuoc: " << sizeof(amlock) << " byte" << std::endl;
+    std::cout << "Checksum SHA-256: ";
+    for (int i = 0; i < 32; i++) {
+        printf("%02x", amlock.header.checksum[i]);
+    }
+    std::cout << std::endl;
+
+    AmlockFile verify_file;
+    std::ifstream verify_stream(output_path, std::ios::binary);
+    verify_stream.read(reinterpret_cast<char*>(&verify_file), sizeof(verify_file));
+    verify_stream.close();
+
+    uint8_t verify_sha[32];
+    uint8_t saved_checksum[32];
+    std::memcpy(saved_checksum, verify_file.header.checksum, 32);
+    std::memset(verify_file.header.checksum, 0, 32);
+    compute_sha256(reinterpret_cast<const uint8_t*>(&verify_file), sizeof(verify_file), verify_sha);
+
+    if (std::memcmp(saved_checksum, verify_sha, 32) == 0) {
+        std::cout << "Xac minh thanh cong: File lock hop le" << std::endl;
+    } else {
+        std::cout << "CANH BAO: File lock bi hong hoac da bi sua doi" << std::endl;
+    }
+
+    return 0;
+}
